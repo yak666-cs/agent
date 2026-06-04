@@ -30,7 +30,15 @@ jobs:
 
       - name: Install Buildozer
         run: |
-          pip install --upgrade buildozer cython
+          pip install --upgrade buildozer cython setuptools
+
+      - name: Inspect environment
+        run: |
+          echo "=== Python ===" && python3 --version
+          echo "=== Java ===" && java -version 2>&1 || true
+          echo "=== Buildozer ===" && buildozer --version 2>&1 || true
+          echo "=== Env ===" && env | grep -E 'ANDROID|JAVA|SDK|NDK' || true
+          echo "=== pip packages ===" && pip list 2>&1 | head -30
 
       - name: Cache buildozer
         uses: actions/cache@v4
@@ -41,11 +49,33 @@ jobs:
           key: ${{ runner.os }}-buildozer-${{ hashFiles('buildozer.spec') }}
 
       - name: Build APK
+        id: build_apk
+        continue-on-error: true
         run: |
-          buildozer android debug --verbose
+          buildozer android debug --verbose 2>&1 | tee buildozer_output.log
+
+      - name: Print buildozer log on failure
+        if: steps.build_apk.outcome == 'failure'
+        run: |
+          echo "=== BUILD FAILED ==="
+          [ -f buildozer_output.log ] && tail -100 buildozer_output.log || true
+          [ -f buildozer.log ] && echo "=== buildozer.log ===" && tail -100 buildozer.log || true
+          echo "=== .buildozer dir ===" && find .buildozer -name "*.log" -exec echo "Found: {}" \; 2>/dev/null | head -10 || true
+          exit 1
 
       - name: Upload APK
+        if: steps.build_apk.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: kai-agent-apk
           path: bin/*.apk
+
+      - name: Upload logs on failure
+        if: steps.build_apk.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: buildozer-logs
+          path: |
+            buildozer_output.log
+            buildozer.log
+            .buildozer/**/*.log
