@@ -47,7 +47,7 @@ from typing import Optional, Callable, Awaitable
 from .types import (
     Message, Role, AgentState, AgentStatus, ToolCall, ToolResult
 )
-from .llm import LLMClient
+from .llm import LLMClient, LLMResponse
 from .context import ContextManager
 
 logger = logging.getLogger("agent.loop")
@@ -125,6 +125,21 @@ class AgentLoop:
 
     # ---- 主循环 ----
 
+    def _cache_key(self, messages: list[Message], tools: list[dict] | None) -> str:
+        """为 LLM 请求生成缓存 key。"""
+        import hashlib
+        # 只取最后 2 条消息 + system prompt 做 key（兼顾命中率与安全性）
+        relevant = []
+        for m in messages:
+            if m.role == Role.SYSTEM:
+                relevant.append(f"s:{m.content[:200]}")
+        for m in messages[-2:]:
+            relevant.append(f"{m.role}:{m.content[:500]}")
+        if tools:
+            relevant.append(f"tools:{len(tools)}")
+        raw = "||".join(relevant)
+        return hashlib.md5(raw.encode()).hexdigest()
+
     async def run(self, user_message: str, previous_messages: list[Message] = None) -> str:
         """
         运行 Agent Loop。
@@ -150,6 +165,10 @@ class AgentLoop:
         consecutive_errors = 0
         self.reset_cancel()
 
+        # 响应缓存（LLM 返回后缓存，同一个 key 且 TTL 内直接复用）
+        import time
+        _response_cache: dict[str, tuple[float, str, list[ToolCall], str]] = {}
+
         try:
             for turn in range(self.max_turns):
                 await self._check_cancelled()
@@ -169,11 +188,30 @@ class AgentLoop:
                 elif self._tool_registry:
                     tools = self._tool_registry.get_tools_for_llm()
 
-                # 3. 调用 LLM
+                # 3. 调用 LLM（带响应缓存）
                 await self._check_cancelled()
-                logger.debug(f"Turn {turn+1}: 发送 {len(messages)} 条消息，"
-                            f"{len(tools or [])} 个工具")
-                response = await self.llm.chat(messages, tools=tools)
+                cache_ttl = 2.0  # 2 秒内相同请求命中缓存
+                ckey = self._cache_key(messages, tools)
+                cached = _response_cache.get(ckey)
+                if cached and time.monotonic() - cached[0] < cache_ttl:
+                    response = LLMResponse(
+                        content=cached[1],
+                        tool_calls=cached[2],
+                        finish_reason=cached[3],
+                        usage={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                    )
+                    logger.debug(f"Turn {turn+1}: 响应缓存命中")
+                else:
+                    logger.debug(f"Turn {turn+1}: 发送 {len(messages)} 条消息，"
+                                f"{len(tools or [])} 个工具")
+                    response = await self.llm.chat(messages, tools=tools)
+                    if response.finish_reason != "error":
+                        _response_cache[ckey] = (
+                            time.monotonic(),
+                            response.content or "",
+                            response.tool_calls,
+                            response.finish_reason,
+                        )
 
                 # 更新 token 统计
                 for k in state.token_usage:

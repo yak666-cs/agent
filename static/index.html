@@ -374,6 +374,7 @@ let sessions = [];
 let sessionMessages = {};
 let evtSource = null;
 let lastFilePath = '';
+let generatingSessionId = null;  // 当前正在生成的会话 ID
 
 // ── DOM 就绪后初始化 ──
 document.addEventListener('DOMContentLoaded', () => {
@@ -426,7 +427,16 @@ function renderSessionTabs() {
 }
 
 function selectSession(id) {
-  if (busy || id === currentSessionId) return;
+  if (id === currentSessionId) return;
+  if (busy) {
+    // 切换时中断当前生成
+    if (evtSource) { evtSource.close(); evtSource = null; }
+    busy = false;
+    generatingSessionId = null;
+    sendBtn.disabled = false;
+    typing.classList.remove('show');
+    stopBtn.style.display = 'none';
+  }
   saveCurrentMessages();
   currentSessionId = id;
   renderSessionTabs();
@@ -591,6 +601,7 @@ function doSend(text) {
   typing.classList.add('show');
   stopBtn.style.display = '';
   busy = true;
+  generatingSessionId = currentSessionId;
   sendBtn.disabled = true;
 
   let currentToolCard = null;
@@ -656,6 +667,7 @@ function finishChat(reply, errorMsg) {
   typing.classList.remove('show');
   stopBtn.style.display = 'none';
   busy = false;
+  generatingSessionId = null;
   sendBtn.disabled = false;
   if (reply) {
     addMsg('assistant', marked(reply));
