@@ -1,0 +1,15 @@
+.env
+__pycache__/
+*.pyc
+*.log
+*.ico
+*.bat
+*.vbs
+buildozer.log
+.buildozer/
+.apk-build-venv/
+bin/
+kai_server.log
+debug_log.txt
+startup_log.txt
+uploads/
