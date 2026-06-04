@@ -26,7 +26,7 @@ android.sdk = 33
 
 # 包含 web 前端文件
 source.include_exts = py,png,jpg,kv,atlas,html,js,css,txt
-source.include_patterns = static/*,mobile/*.py,agent/*.py,tools/*.py,tools/builtin/*.py,skills/*.py,skills/builtin/*.py,harness/*.py,.env
+source.include_patterns = *.py,static/*,mobile/*.py,agent/*.py,tools/*.py,tools/builtin/*.py,skills/*.py,skills/builtin/*.py,harness/*.py,.env
 
 # 排除
 source.exclude_patterns = tests/*,__pycache__/*,*.pyc
