@@ -1,43 +1,69 @@
 """
-LLM 调用封装 —— 默认使用 DeepSeek API
-
-DeepSeek 的 API 完全兼容 OpenAI 格式，只需改 base_url 和 model。
-如果你以后想换其他模型（GPT-4o、Claude 等），只需改环境变量即可。
-
-设计取舍：
-- 直接用 httpx 调 REST API，不依赖 openai SDK
-- 每次调用记录 token 用量
+LLM client wrapper, defaulting to a DeepSeek-compatible chat API.
 """
 
 import json
 import os
 from dataclasses import dataclass
+from enum import Enum
 from typing import Optional
+
 import httpx
 
 from .types import Message, ToolCall
 
 
+class LLMErrorType(str, Enum):
+    RATE_LIMIT = "rate_limit"
+    TIMEOUT = "timeout"
+    CONNECTION = "connection"
+    AUTH = "auth"
+    BAD_REQUEST = "bad_request"
+    CONTEXT_LENGTH = "context_length"
+    SERVER = "server_error"
+    INVALID_RESPONSE = "invalid_response"
+    CIRCUIT_OPEN = "circuit_open"
+    UNKNOWN = "unknown"
+
+
 @dataclass
 class LLMResponse:
-    """LLM 返回的统一结构"""
-    content: Optional[str]        # 纯文本回复（没调工具时）
-    tool_calls: list[ToolCall]    # 工具调用列表（调工具时）
-    finish_reason: str            # "stop" | "tool_calls" | "length" | "error"
-    usage: dict[str, int]         # token 用量
+    """Normalized LLM response."""
+
+    content: Optional[str]
+    tool_calls: list[ToolCall]
+    finish_reason: str
+    usage: dict[str, int]
+    error_type: Optional[str] = None
+    status_code: Optional[int] = None
+    retryable: bool = False
+    retry_after_seconds: Optional[float] = None
+
+    @classmethod
+    def error(
+        cls,
+        content: str,
+        *,
+        error_type: str,
+        status_code: Optional[int] = None,
+        retryable: bool = False,
+        retry_after_seconds: Optional[float] = None,
+    ) -> "LLMResponse":
+        return cls(
+            content=content,
+            tool_calls=[],
+            finish_reason="error",
+            usage={},
+            error_type=error_type,
+            status_code=status_code,
+            retryable=retryable,
+            retry_after_seconds=retry_after_seconds,
+        )
 
 
 class LLMClient:
     """
-    LLM 客户端，默认连接 DeepSeek API。
-
-    只需要一个环境变量就能跑：
-        export DEEPSEEK_API_KEY=sk-xxx
-
-    换成其他模型也很简单：
-        export LLM_API_KEY=sk-xxx
-        export LLM_BASE_URL=https://api.openai.com/v1
-        export LLM_MODEL=gpt-4o
+    Lightweight OpenAI-compatible LLM client.
     """
 
     def __init__(
@@ -46,7 +72,6 @@ class LLMClient:
         base_url: str = None,
         model: str = None,
     ):
-        # 自动检测：有 DEEPSEEK_API_KEY 就用 DeepSeek
         self.api_key = (
             api_key
             or os.getenv("DEEPSEEK_API_KEY")
@@ -65,15 +90,6 @@ class LLMClient:
         temperature: float = 0.2,
         max_tokens: int = 4096,
     ) -> LLMResponse:
-        """
-        发送 chat completion 请求。
-
-        参数:
-            messages: 完整的对话历史
-            tools: 可用的工具定义列表（OpenAI format）
-            temperature: 创造性控制（Agent 场景建议低温度以保证一致性）
-            max_tokens: 最大输出 token
-        """
         url = f"{self.base_url}/chat/completions"
 
         body = {
@@ -92,8 +108,6 @@ class LLMClient:
             "Content-Type": "application/json",
         }
 
-        # 自动检测系统代理（Windows 环境变量）
-        import urllib.request
         proxies = {}
         http_proxy = os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
         https_proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
@@ -102,54 +116,60 @@ class LLMClient:
         if https_proxy:
             proxies["https://"] = https_proxy
 
-        async with httpx.AsyncClient(timeout=120.0, proxy=proxies.get("https://") or proxies.get("http://")) as client:
+        async with httpx.AsyncClient(
+            timeout=120.0,
+            proxy=proxies.get("https://") or proxies.get("http://"),
+        ) as client:
             try:
                 resp = await client.post(url, json=body, headers=headers)
-                if resp.status_code != 200:
-                    error_detail = resp.text[:500]
-                    return LLMResponse(
-                        content=f"(API 错误 {resp.status_code}) {error_detail}",
-                        tool_calls=[],
-                        finish_reason="error",
-                        usage={},
-                    )
-                data = resp.json()
             except httpx.ConnectError as e:
-                return LLMResponse(
-                    content=f"(连接失败) 无法连接到 {self.base_url}。"
-                            f"请检查网络和代理设置。详情: {e}",
-                    tool_calls=[],
-                    finish_reason="error",
-                    usage={},
+                return LLMResponse.error(
+                    f"(connect error) Unable to reach {self.base_url}: {e}",
+                    error_type=LLMErrorType.CONNECTION,
+                    retryable=True,
                 )
             except httpx.TimeoutException:
-                return LLMResponse(
-                    content=f"(请求超时) 连接 {self.base_url} 超时，请检查网络或代理",
-                    tool_calls=[],
-                    finish_reason="error",
-                    usage={},
+                return LLMResponse.error(
+                    f"(timeout) Request to {self.base_url} timed out",
+                    error_type=LLMErrorType.TIMEOUT,
+                    retryable=True,
                 )
             except Exception as e:
-                return LLMResponse(
-                    content=f"(网络错误) {type(e).__name__}: {e}",
-                    tool_calls=[],
-                    finish_reason="error",
-                    usage={},
+                return LLMResponse.error(
+                    f"(network error) {type(e).__name__}: {e}",
+                    error_type=LLMErrorType.UNKNOWN,
+                    retryable=True,
                 )
 
-        choice = data["choices"][0]
-        message = choice["message"]
+        if resp.status_code != 200:
+            return self._build_http_error_response(resp)
+
+        try:
+            data = resp.json()
+        except ValueError as e:
+            return LLMResponse.error(
+                f"(invalid response) JSON parse failed: {e}",
+                error_type=LLMErrorType.INVALID_RESPONSE,
+            )
+
+        try:
+            choice = data["choices"][0]
+            message = choice["message"]
+        except (KeyError, IndexError, TypeError) as e:
+            return LLMResponse.error(
+                f"(invalid response) Missing choices/message: {e}",
+                error_type=LLMErrorType.INVALID_RESPONSE,
+            )
+
         finish = choice.get("finish_reason", "stop")
         usage = data.get("usage", {})
 
-        # 解析 tool_calls
         tool_calls = []
         raw_tool_calls = message.get("tool_calls", [])
         for tc in raw_tool_calls:
             try:
                 tool_calls.append(ToolCall.from_dict(tc))
-            except (json.JSONDecodeError, KeyError) as e:
-                # 单个 tool_call 解析失败不阻塞整体
+            except (json.JSONDecodeError, KeyError, TypeError):
                 continue
 
         return LLMResponse(
@@ -162,3 +182,70 @@ class LLMClient:
                 "total_tokens": usage.get("total_tokens", 0),
             },
         )
+
+    def _build_http_error_response(self, resp: httpx.Response) -> LLMResponse:
+        error_detail = resp.text[:500]
+        retry_after_seconds = self._parse_retry_after(resp.headers.get("retry-after"))
+        status_code = resp.status_code
+
+        if status_code == 400:
+            error_type = self._classify_bad_request(error_detail)
+            return LLMResponse.error(
+                f"(API error {status_code}) {error_detail}",
+                error_type=error_type,
+                status_code=status_code,
+                retryable=False,
+            )
+        if status_code in (401, 403):
+            return LLMResponse.error(
+                f"(API error {status_code}) {error_detail}",
+                error_type=LLMErrorType.AUTH,
+                status_code=status_code,
+                retryable=False,
+            )
+        if status_code == 429:
+            return LLMResponse.error(
+                f"(API error {status_code}) {error_detail}",
+                error_type=LLMErrorType.RATE_LIMIT,
+                status_code=status_code,
+                retryable=True,
+                retry_after_seconds=retry_after_seconds,
+            )
+        if status_code in (408, 499, 502, 503, 504) or status_code >= 500:
+            return LLMResponse.error(
+                f"(API error {status_code}) {error_detail}",
+                error_type=LLMErrorType.SERVER,
+                status_code=status_code,
+                retryable=True,
+                retry_after_seconds=retry_after_seconds,
+            )
+        return LLMResponse.error(
+            f"(API error {status_code}) {error_detail}",
+            error_type=LLMErrorType.BAD_REQUEST,
+            status_code=status_code,
+            retryable=False,
+        )
+
+    @staticmethod
+    def _classify_bad_request(error_detail: str) -> str:
+        text = (error_detail or "").lower()
+        context_markers = [
+            "context length",
+            "maximum context length",
+            "too many tokens",
+            "prompt is too long",
+            "maximum tokens",
+        ]
+        if any(marker in text for marker in context_markers):
+            return LLMErrorType.CONTEXT_LENGTH
+        return LLMErrorType.BAD_REQUEST
+
+    @staticmethod
+    def _parse_retry_after(value: Optional[str]) -> Optional[float]:
+        if not value:
+            return None
+        try:
+            seconds = float(value)
+        except ValueError:
+            return None
+        return max(0.0, seconds)
