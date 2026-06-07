@@ -546,7 +546,6 @@ JSON 格式:
                     llm=self._llm,
                     context=ctx,
                     max_turns=max_turns,
-                    enable_orchestration=False,
                 )
                 if child_registry:
                     agent.register_tool_registry(child_registry)

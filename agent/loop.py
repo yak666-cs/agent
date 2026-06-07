@@ -3,15 +3,17 @@ Core agent loop: user message -> LLM -> tools -> LLM -> final answer.
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import time
 from typing import Callable, Optional
 
+from harness.resilience import RetryConfig, get_circuit_breaker, retry_with_backoff
+
 from .context import ContextManager
 from .llm import LLMClient, LLMErrorType, LLMResponse
 from .types import AgentState, AgentStatus, Message, Role, ToolCall, ToolResult
-from harness.resilience import RetryConfig, get_circuit_breaker, retry_with_backoff
 
 logger = logging.getLogger("agent.loop")
 
@@ -60,6 +62,7 @@ class AgentLoop:
 
         self._cancel_event: asyncio.Event = asyncio.Event()
         self._last_state: Optional[AgentState] = None
+        self._tool_call_repetitions: dict[str, int] = {}
 
     def cancel(self):
         self._cancel_event.set()
@@ -71,21 +74,6 @@ class AgentLoop:
     async def _check_cancelled(self):
         if self._cancel_event.is_set():
             raise asyncio.CancelledError("User cancelled agent execution")
-
-    @staticmethod
-    def _capture_user_location(messages: list, current_message: str) -> str:
-        """扫描对话历史，提取用户陈述的位置信息。"""
-        # 如果当前消息包含位置声明，直接返回
-        for prefix in ("我在", "我位于", "我住在", "我在广州"):
-            if prefix in current_message:
-                return current_message[:200]
-
-        # 从历史消息中找最后一条含 "我在" 的用户消息
-        for msg in reversed(messages):
-            if msg.role == Role.USER and msg.content and "我在" in msg.content:
-                return msg.content[:200]
-
-        return ""
 
     def register_tool_executor(self, executor):
         self._tool_executor = executor
@@ -143,10 +131,10 @@ class AgentLoop:
                 tools=tools,
                 config=self._retry_config,
             )
-        except Exception as e:
+        except Exception as exc:
             self._circuit_breaker.record_failure()
             return LLMResponse.error(
-                f"(network error) {type(e).__name__}: {e}",
+                f"(network error) {type(exc).__name__}: {exc}",
                 error_type=LLMErrorType.UNKNOWN,
                 retryable=True,
             )
@@ -190,8 +178,6 @@ class AgentLoop:
 
     @staticmethod
     def _cache_key(messages: list[Message], tools: list[dict] | None) -> str:
-        import hashlib
-
         relevant = []
         for msg in messages:
             if msg.role == Role.SYSTEM:
@@ -202,6 +188,42 @@ class AgentLoop:
             relevant.append(f"tools:{len(tools)}")
         return hashlib.md5("||".join(relevant).encode("utf-8", errors="replace")).hexdigest()
 
+    @staticmethod
+    def _tool_signature(tool_call: ToolCall) -> str:
+        payload = json.dumps(tool_call.arguments, ensure_ascii=False, sort_keys=True)
+        raw = f"{tool_call.name}::{payload}"
+        return hashlib.md5(raw.encode("utf-8", errors="replace")).hexdigest()
+
+    @staticmethod
+    def _summarize_failure(result: ToolResult) -> str:
+        reason = (result.error or "").strip() or "Unknown error"
+        if reason.startswith("娌欑鎷掔粷:"):
+            detail = reason.split(":", 1)[1].strip() if ":" in reason else reason
+            return f"- `{result.name}` was blocked by the sandbox: {detail}"
+        if reason.startswith("Blocked repeated identical tool call"):
+            return (
+                f"- `{result.name}` kept being called with the same arguments, "
+                "so the agent stopped the loop to avoid wasting tokens."
+            )
+        if "Tool not found" in reason:
+            return f"- `{result.name}` is unavailable in the current runtime."
+        return f"- `{result.name}` failed: {reason}"
+
+    def _build_failure_report(self, results: list[ToolResult], heading: str) -> str:
+        lines = [heading]
+        seen: set[tuple[str, str]] = set()
+        for result in results:
+            if result.success:
+                continue
+            key = (result.name, result.error or "")
+            if key in seen:
+                continue
+            seen.add(key)
+            lines.append(self._summarize_failure(result))
+        if len(lines) == 1:
+            return heading
+        return "\n".join(lines)
+
     async def run(self, user_message: str, previous_messages: list[Message] = None) -> str:
         state = AgentState()
         self._set_status(state, AgentStatus.THINKING)
@@ -210,16 +232,12 @@ class AgentLoop:
             state.messages.extend(previous_messages)
         state.messages.append(Message(role=Role.USER, content=user_message))
 
-        # 扫描用户消息中的位置声明，持久化到 system prompt 避免被裁剪
-        stated_location = self._capture_user_location(state.messages, user_message)
-        if stated_location and not self.context.location_context:
-            self.context.location_context = f"[用户陈述的位置] {stated_location}"
-
         logger.info("Agent loop started | user=%s", user_message[:80])
 
         consecutive_errors = 0
         self.reset_cancel()
         response_cache: dict[str, tuple[float, str, list[ToolCall], str]] = {}
+        self._tool_call_repetitions = {}
 
         try:
             for turn in range(self.max_turns):
@@ -325,6 +343,20 @@ class AgentLoop:
                             self._on_tool_call(tc)
 
                     async def _exec_one(tc: ToolCall) -> ToolResult:
+                        signature = self._tool_signature(tc)
+                        repeat_count = self._tool_call_repetitions.get(signature, 0) + 1
+                        self._tool_call_repetitions[signature] = repeat_count
+                        if repeat_count > 2:
+                            return ToolResult(
+                                tool_call_id=tc.id,
+                                name=tc.name,
+                                success=False,
+                                output="",
+                                error=(
+                                    "Blocked repeated identical tool call. "
+                                    "Use a different query/argument or answer the user with the current evidence."
+                                ),
+                            )
                         tool = self._tool_registry.get(tc.name) if self._tool_registry else None
                         if tool is None:
                             return ToolResult(
@@ -338,7 +370,7 @@ class AgentLoop:
 
                     results = await asyncio.gather(*[_exec_one(tc) for tc in response.tool_calls])
 
-                    for tc, result in zip(response.tool_calls, results):
+                    for result in results:
                         state.tool_result_history.append(result)
                         if self._on_tool_result:
                             self._on_tool_result(result)
@@ -359,20 +391,25 @@ class AgentLoop:
                         else:
                             consecutive_errors = 0
 
-                    # 首次成功调用后禁用 ip_geolocation，防止 LLM 反复获取位置
-                    if any(r.name == "ip_geolocation" and r.success for r in results):
+                    repeated_call_blocked = [
+                        result
+                        for result in results
+                        if (result.error or "").startswith("Blocked repeated identical tool call")
+                    ]
+                    if repeated_call_blocked and len(repeated_call_blocked) == len(results):
+                        self._set_status(state, AgentStatus.DONE)
+                        if self._on_turn_end:
+                            self._on_turn_end(state)
+                        self._last_state = state
+                        return self._build_failure_report(
+                            results,
+                            "Agent stopped because it was repeating the same tool call without getting new evidence.",
+                        )
+
+                    if any(result.name == "ip_geolocation" and result.success for result in results):
                         if self._tool_registry:
                             self._tool_registry.disable("ip_geolocation")
                             logger.info("Disabled ip_geolocation after first successful use")
-                        # 把位置信息持久化到 system prompt 区域，避免被裁剪/过滤丢失
-                        for r in results:
-                            if r.name == "ip_geolocation" and r.success:
-                                stated = self.context.location_context  # 可能已有用户声明的位置
-                                ip_info = r.output.strip()
-                                if stated and "[用户陈述的位置]" in stated:
-                                    self.context.location_context = f"{stated}\n[IP定位] {ip_info}"
-                                else:
-                                    self.context.location_context = f"[已知位置信息] {ip_info}"
 
                     self._set_status(state, AgentStatus.THINKING)
                     if self._on_turn_end:
@@ -397,7 +434,7 @@ class AgentLoop:
                 if response.content:
                     return response.content
                 for msg in reversed(state.messages):
-                    if msg.role == Role.ASSISTANT and msg.content and msg.content not in ("", "(call failed) "):
+                    if msg.role == Role.ASSISTANT and msg.content and msg.content != "(call failed) ":
                         return msg.content
                 for result in reversed(state.tool_result_history):
                     if result.success and result.output:
@@ -409,6 +446,17 @@ class AgentLoop:
                 self._on_turn_end(state)
             self._last_state = state
             logger.warning("Reached max turns: %s", self.max_turns)
+            recent_failures = [
+                result for result in state.tool_result_history[-8:] if not result.success
+            ]
+            if recent_failures:
+                return self._build_failure_report(
+                    recent_failures,
+                    (
+                        f"Reached max reasoning turns ({self.max_turns}) before completing the task. "
+                        "The blocking issues were:"
+                    ),
+                )
             return (
                 f"Reached max reasoning turns ({self.max_turns}); agent stopped.\n"
                 f"Tool calls: {len(state.tool_call_history)}\n"
