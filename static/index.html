@@ -192,7 +192,7 @@
   .tool-card summary {
     cursor: pointer; padding: 8px 14px;
     background: #f5f1ec; border: 1px solid #e2d8cc; border-radius: 8px;
-    font-size: 13px; color: #6b6259; user-select: none; display: flex; align-items: center; gap: 8px;
+    font-size: 13px; color: #6b6259; user-select: text; display: flex; align-items: center; gap: 8px;
   }
   .tool-card summary:hover { background: #efebe6; }
   .tool-card .icon { font-size: 14px; }
@@ -205,6 +205,7 @@
     border-radius: 0 0 8px 8px; padding: 12px 14px; font-size: 13px;
     font-family: "JetBrains Mono", "Cascadia Code", monospace;
     white-space: pre-wrap; word-break: break-all; max-height: 300px; overflow-y: auto;
+    user-select: text;
   }
 
   /* ── Typing ── */
@@ -685,12 +686,10 @@ async function loadCtxData() {
     const data = await resp.json();
     let html = '';
     html += '<div class="ctx-section">';
-    html += '<div class="ctx-label">上下文配置</div>';
-    html += '<div class="ctx-row"><span>窗口大小</span><span class="ctx-val">' + (data.window_size || 40) + ' 条</span></div>';
-    html += '<div class="ctx-row"><span>最大 Token</span><span class="ctx-val">' + (data.max_tokens || 128000).toLocaleString() + '</span></div>';
-    html += '<div class="ctx-row"><span>保留 Token</span><span class="ctx-val">' + (data.reserve_tokens || 4000).toLocaleString() + '</span></div>';
-    html += '<div class="ctx-row"><span>历史摘要</span><span class="ctx-val">' + (data.enable_summary ? '✅ 开启' : '❌ 关闭') + '</span></div>';
-    html += '<div class="ctx-row"><span>相关性裁剪</span><span class="ctx-val">' + (data.enable_relevance ? '✅ 开启' : '❌ 关闭') + '</span></div>';
+    html += '<div class="ctx-label">上下文策略</div>';
+    html += '<div class="ctx-row"><span>策略</span><span class="ctx-val">' + (data.strategy || '200K 全量保留，超出时中间裁剪') + '</span></div>';
+    html += '<div class="ctx-row"><span>最大 Token</span><span class="ctx-val">' + (data.max_tokens || 200000).toLocaleString() + '</span></div>';
+    html += '<div class="ctx-row"><span>保留 Token</span><span class="ctx-val">' + (data.reserve_tokens || 2000).toLocaleString() + '</span></div>';
     html += '</div>';
     const logs = data.compression_log || [];
     html += '<div class="ctx-section">';
@@ -1053,11 +1052,76 @@ function selectSession(id) {
   currentSessionId = id;
   renderSessionTabs();
   chatArea.innerHTML = '';
-  const msgs = sessionMessages[id] || [];
-  for (const m of msgs) chatArea.appendChild(m.node);
-  if (msgs.length === 0) addMsg('system', '新会话已就绪，可以提问了');
+  const msgs = sessionMessages[id];
+  if (msgs) {
+    for (const m of msgs) chatArea.appendChild(m.node);
+    if (msgs.length === 0) addMsg('system', '新会话已就绪，可以提问了');
+  } else {
+    addMsg('system', '加载中…');
+    loadSessionMessagesFromServer(id).then(function(loaded) {
+      if (currentSessionId !== id) return;
+      chatArea.innerHTML = '';
+      if (loaded.length > 0) {
+        for (const m of loaded) chatArea.appendChild(m.node);
+      } else {
+        addMsg('system', '新会话已就绪，可以提问了');
+      }
+      scrollToBottom();
+    });
+  }
   scrollToBottom(); input.focus();
   if (sidebarVisible) refreshObservability();
+}
+
+async function loadSessionMessagesFromServer(id) {
+  try {
+    const resp = await authFetch('/api/sessions/' + id + '/messages');
+    const msgs = await resp.json();
+    if (!Array.isArray(msgs) || msgs.length === 0) return [];
+    const nodes = [];
+    let toolCalls = [];
+    for (const m of msgs) {
+      if (m.role === 'user') {
+        const div = document.createElement('div');
+        div.className = 'msg user';
+        div.innerHTML = '<div class="msg-body">' + escapeHtml(m.content || '') + '</div>';
+        nodes.push({ node: div });
+      } else if (m.role === 'assistant') {
+        if (m.tool_data && m.tool_data.type === 'tool_calls') {
+          toolCalls = m.tool_data.data || [];
+        } else if (m.content) {
+          const div = document.createElement('div');
+          div.className = 'msg assistant';
+          div.innerHTML = '<div class="msg-body">' + marked(m.content) + '</div>';
+          nodes.push({ node: div });
+        }
+      } else if (m.role === 'tool') {
+        const tcId = m.tool_data && m.tool_data.tool_call_id;
+        const idx = toolCalls.findIndex(function(t) { return t.id === tcId; });
+        if (idx !== -1) {
+          const tc = toolCalls[idx];
+          toolCalls.splice(idx, 1);
+          const name = (tc.function && tc.function.name) || (m.tool_data && m.tool_data.name) || 'unknown';
+          let args = tc.function && tc.function.arguments || {};
+          if (typeof args === 'string') { try { args = JSON.parse(args); } catch(e) {} }
+          const details = document.createElement('details');
+          details.className = 'tool-card';
+          const iconMap = {bash:'⚡',read_file:'📖',write_file:'✏️',web_search:'🔍',python_repl:'🐍',system_info:'🖥',process_manager:'📋',read_document:'📄',memory:'🧠',ip_geolocation:'🌐',subagent_delegate:'🔀'};
+          const icon = iconMap[name] || '🔧';
+          details.innerHTML = '<summary><span class="icon">' + icon + '</span> <span class="name">' + name + '</span> <span class="status ok">✅ 成功</span></summary>';
+          const dd = document.createElement('div'); dd.className = 'detail';
+          dd.textContent = m.content || JSON.stringify(args, null, 2);
+          details.appendChild(dd);
+          nodes.push({ node: details });
+        }
+      }
+    }
+    sessionMessages[id] = nodes;
+    return nodes;
+  } catch (e) {
+    console.error('loadSessionMessagesFromServer error:', e);
+    return [];
+  }
 }
 
 function saveCurrentMessages() {
@@ -1152,7 +1216,7 @@ function doSend(text) {
   evtSource.addEventListener('turn', (e) => { try { turnCount = JSON.parse(e.data).turn || turnCount+1; } catch(e){} document.getElementById('stat-turns').textContent = turnCount; document.getElementById('stats-bar').classList.add('show'); });
   evtSource.addEventListener('agent_status', (e) => { try { const d=JSON.parse(e.data); document.getElementById('stat-turns').textContent=d.turn||0; document.getElementById('stat-tools').textContent=d.tool_calls||0; } catch(e){} });
   evtSource.addEventListener('tool_call', (e) => { const d=JSON.parse(e.data); typing.classList.remove('show'); toolCallCount++; document.getElementById('stat-tools').textContent=toolCallCount; currentToolCard=addToolCard(d.name,d.arguments,'pending',JSON.stringify(d.arguments,null,2)); });
-  evtSource.addEventListener('tool_result', (e) => { const d=JSON.parse(e.data); if(currentToolCard){ const s=currentToolCard.querySelector('summary'); const st=d.status==='success'?'✅ 成功':'❌ 失败'; const sc=d.status==='success'?'ok':'fail'; s.innerHTML=s.innerHTML.replace(/ <span class="status">.*?<\/span>/,' <span class="status '+sc+'">'+st+'</span>'); currentToolCard.open=false; const dd=currentToolCard.querySelector('.detail'); if(dd) dd.textContent=(d.output||'(无输出)')+(d.error?'\n[错误] '+d.error:''); currentToolCard=null; } });
+  evtSource.addEventListener('tool_result', (e) => { const d=JSON.parse(e.data); if(currentToolCard){ const s=currentToolCard.querySelector('summary'); const st=d.status==='success'?'✅ 成功':'❌ 失败'; const sc=d.status==='success'?'ok':'fail'; s.innerHTML=s.innerHTML.replace(/ <span class="status">.*?<\/span>/,' <span class="status '+sc+'">'+st+'</span>'); currentToolCard.open=true; const dd=currentToolCard.querySelector('.detail'); if(dd) dd.textContent=(d.output||'(无输出)')+(d.error?'\n[错误] '+d.error:''); currentToolCard=null; } });
   evtSource.addEventListener('done', (e) => { const d=JSON.parse(e.data); if(d.metrics) document.getElementById('stat-tokens').textContent=(d.metrics.total_tokens||0).toLocaleString(); finishChat(d.reply); if(sidebarVisible) refreshObservability(); });
   evtSource.addEventListener('error', (e) => { if(e.eventPhase===EventSource.CLOSED) return; let m='连接异常'; if(e.data){try{m=JSON.parse(e.data).error||m}catch(e){}} finishChat(null,m); });
 }

@@ -16,7 +16,7 @@ class IpGeolocationTool(BaseTool):
     def __init__(self):
         super().__init__(ToolMeta(
             name="ip_geolocation",
-            description="获取当前设备的大致地理位置（城市、省份）。用于天气查询、本地服务等场景。注意：此工具每轮对话只需调用一次，返回的位置信息在整个对话中持续有效，无需重复获取。获取城市后如需天气数据请使用 web_search 工具。",
+            description="获取当前设备的大致地理位置（城市、省份）。用于天气查询、本地服务等场景。注意：此工具每轮对话只需调用一次，返回的位置信息在整个对话中持续有效，无需重复获取。获取城市后如需天气数据请使用 web_search 的 ddg 源搜索城市天气，从结果中选择链接填入 read_content 参数查看详情",
             permission=Permission.READ_ONLY,
             timeout_seconds=10.0,
             cache_ttl=300.0,

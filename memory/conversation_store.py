@@ -155,5 +155,28 @@ class ConversationStore:
         self._conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
         self._conn.commit()
 
+    def replace_session_messages(self, session_id: str, messages: list[dict]):
+        """原子替换：在单个事务中删除旧消息并写入新消息。"""
+        if not messages:
+            return
+        now = time.time()
+        self._conn.execute("BEGIN IMMEDIATE")
+        self._conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+        rows = [
+            (session_id, m["role"], m.get("content", ""),
+             json.dumps(m.get("tool_data"), ensure_ascii=False) if m.get("tool_data") else None,
+             now + i * 0.001)
+            for i, m in enumerate(messages)
+        ]
+        self._conn.executemany(
+            "INSERT INTO messages (session_id, role, content, tool_data, created_at) VALUES (?, ?, ?, ?, ?)",
+            rows,
+        )
+        self._conn.execute(
+            "UPDATE sessions SET updated_at = ? WHERE id = ?",
+            (time.time(), session_id),
+        )
+        self._conn.commit()
+
     def close(self):
         self._conn.close()

@@ -72,6 +72,21 @@ class AgentLoop:
         if self._cancel_event.is_set():
             raise asyncio.CancelledError("User cancelled agent execution")
 
+    @staticmethod
+    def _capture_user_location(messages: list, current_message: str) -> str:
+        """扫描对话历史，提取用户陈述的位置信息。"""
+        # 如果当前消息包含位置声明，直接返回
+        for prefix in ("我在", "我位于", "我住在", "我在广州"):
+            if prefix in current_message:
+                return current_message[:200]
+
+        # 从历史消息中找最后一条含 "我在" 的用户消息
+        for msg in reversed(messages):
+            if msg.role == Role.USER and msg.content and "我在" in msg.content:
+                return msg.content[:200]
+
+        return ""
+
     def register_tool_executor(self, executor):
         self._tool_executor = executor
 
@@ -194,6 +209,11 @@ class AgentLoop:
         if previous_messages:
             state.messages.extend(previous_messages)
         state.messages.append(Message(role=Role.USER, content=user_message))
+
+        # 扫描用户消息中的位置声明，持久化到 system prompt 避免被裁剪
+        stated_location = self._capture_user_location(state.messages, user_message)
+        if stated_location and not self.context.location_context:
+            self.context.location_context = f"[用户陈述的位置] {stated_location}"
 
         logger.info("Agent loop started | user=%s", user_message[:80])
 
@@ -338,6 +358,21 @@ class AgentLoop:
                             logger.warning("Tool '%s' failed: %s", result.name, result.error)
                         else:
                             consecutive_errors = 0
+
+                    # 首次成功调用后禁用 ip_geolocation，防止 LLM 反复获取位置
+                    if any(r.name == "ip_geolocation" and r.success for r in results):
+                        if self._tool_registry:
+                            self._tool_registry.disable("ip_geolocation")
+                            logger.info("Disabled ip_geolocation after first successful use")
+                        # 把位置信息持久化到 system prompt 区域，避免被裁剪/过滤丢失
+                        for r in results:
+                            if r.name == "ip_geolocation" and r.success:
+                                stated = self.context.location_context  # 可能已有用户声明的位置
+                                ip_info = r.output.strip()
+                                if stated and "[用户陈述的位置]" in stated:
+                                    self.context.location_context = f"{stated}\n[IP定位] {ip_info}"
+                                else:
+                                    self.context.location_context = f"[已知位置信息] {ip_info}"
 
                     self._set_status(state, AgentStatus.THINKING)
                     if self._on_turn_end:

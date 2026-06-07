@@ -13,3 +13,5 @@ kai_server.log
 debug_log.txt
 startup_log.txt
 uploads/
+.kai_cache/
+data/
