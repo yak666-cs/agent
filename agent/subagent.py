@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
+from .task_recipes import TaskRecipeExecutor
 
 # ── 子代理定义（类似 Claude SDK 的 AgentDefinition） ──
 
@@ -75,9 +76,9 @@ class DecompositionResult:
     execution_mode: ExecutionMode = ExecutionMode.PARALLEL
 
     def summary(self) -> str:
-        lines = [f"目标 / Goal: {self.main_goal}", f"模式 / Mode: {self.execution_mode.value}"]
+        lines = [f"目标: {self.main_goal}", f"模式: {self.execution_mode.value}"]
         for task in self.subtasks:
-            deps = f" [依赖 / deps: {', '.join(task.dependencies)}]" if task.dependencies else ""
+            deps = f" [依赖: {', '.join(task.dependencies)}]" if task.dependencies else ""
             lines.append(f"  - [{task.id}] {task.name}{deps}")
         return "\n".join(lines)
 
@@ -103,6 +104,7 @@ class SubagentManager:
         self._context_manager = context_manager
         self.max_workers = max_workers
         self._results: list[SubTask] = []
+        self._task_recipes = TaskRecipeExecutor()
         self._cb_decompose = on_decompose
         self._cb_subtask_start = on_subtask_start
         self._cb_subtask_done = on_subtask_done
@@ -116,6 +118,7 @@ class SubagentManager:
         previous_results: list[dict] = None,
     ) -> str:
         logger.info("SubagentManager start | task=%s", (main_task or "")[:80])
+        self._main_task = main_task
 
         # 如果 subagent_tool 在 manager 上设置了 _subagent_def，传递给所有子任务
         subagent_def: Optional[SubagentDef] = getattr(self, '_subagent_def', None)
@@ -179,30 +182,32 @@ class SubagentManager:
         return summary
 
     async def _decompose(self, main_task: str, context: str) -> DecompositionResult:
+        if self._task_recipes.matches_repo_audit(main_task):
+            return self._task_recipes.make_repo_audit_plan(main_task)
+
         if not self._llm:
             return self._simple_decompose(main_task)
 
-        prompt = f"""You are a task decomposition specialist.
-Break the user request into executable subtasks and return JSON only.
+        prompt = f"""你是任务分解专家。请将用户请求分解为可执行的子任务，只返回 JSON。
 
-User request: {main_task}
-Additional context: {context or "(none)"}
+用户请求: {main_task}
+额外上下文: {context or "(无)"}
 
-Requirements:
-- Keep each subtask concrete and independently executable.
-- Use dependencies when one step needs the result of another.
-- Choose "parallel", "sequential", or "mixed" for execution_mode.
+要求:
+- 每个子任务具体且独立可执行
+- 有依赖关系的子任务用 dependencies 标注
+- execution_mode 可选 "parallel"、"sequential"、"mixed"
 
-JSON schema:
+JSON 格式:
 {{
-  "main_goal": "short summary",
+  "main_goal": "简短总结",
   "execution_mode": "mixed",
   "subtasks": [
     {{
       "id": "1",
-      "name": "subtask name",
-      "description": "what to do",
-      "instructions": "detailed instructions",
+      "name": "子任务名称",
+      "description": "做什么",
+      "instructions": "详细执行说明",
       "dependencies": []
     }}
   ]
@@ -474,12 +479,37 @@ JSON schema:
             def get_tools_for_llm(self):
                 return [t.to_openai_tool() for t in self.list_enabled()]
 
+            def disable(self, name: str):
+                if hasattr(self._base, 'disable'):
+                    self._base.disable(name)
+
+            def enable(self, name: str):
+                if hasattr(self._base, 'enable'):
+                    self._base.enable(name)
+
         registry = _FilteredRegistry(self._tool_registry, allowed_set, excluded)
         selector = None
         if self._tool_selector:
             from tools.selector import ToolSelector
             selector = ToolSelector(registry, top_k=getattr(self._tool_selector, "top_k", 20))
         return registry, selector
+
+    async def _invoke_execute_single(
+        self,
+        subtask: SubTask,
+        context_info: str = "",
+        subagent_def: Optional[SubagentDef] = None,
+    ) -> SubTask:
+        try:
+            return await self._execute_single(
+                subtask,
+                context_info,
+                subagent_def=subagent_def,
+            )
+        except TypeError as exc:
+            if "unexpected keyword argument 'subagent_def'" not in str(exc):
+                raise
+            return await self._execute_single(subtask, context_info)
 
     async def _execute_single(self, subtask: SubTask, context_info: str = "",
                               subagent_def: Optional[SubagentDef] = None) -> SubTask:
@@ -489,6 +519,21 @@ JSON schema:
             self._cb_subtask_start(subtask.id, subtask.name)
 
         try:
+            recipe_result = self._task_recipes.maybe_execute(subtask, context_info)
+            if recipe_result is not None:
+                subtask.result = recipe_result
+                subtask.status = "success"
+                subtask.duration_ms = (time.monotonic() - start) * 1000
+                if self._cb_subtask_done:
+                    self._cb_subtask_done(
+                        subtask.id,
+                        subtask.name,
+                        subtask.status,
+                        (subtask.result or "")[:200],
+                        subtask.duration_ms,
+                    )
+                return subtask
+
             if self._llm and self._tool_registry:
                 from agent.loop import AgentLoop
 
@@ -497,7 +542,12 @@ JSON schema:
 
                 ctx = self._make_child_context()
                 child_registry, child_selector = self._make_child_registry_and_selector(allowed_tools)
-                agent = AgentLoop(llm=self._llm, context=ctx, max_turns=max_turns)
+                agent = AgentLoop(
+                    llm=self._llm,
+                    context=ctx,
+                    max_turns=max_turns,
+                    enable_orchestration=False,
+                )
                 if child_registry:
                     agent.register_tool_registry(child_registry)
                 if self._tool_executor:
@@ -562,7 +612,7 @@ JSON schema:
 
         async def _run_with_sem(task: SubTask) -> SubTask:
             async with sem:
-                return await self._execute_single(task, subagent_def=subagent_def)
+                return await self._invoke_execute_single(task, subagent_def=subagent_def)
 
         return await asyncio.gather(*[_run_with_sem(task) for task in subtasks])
 
@@ -605,7 +655,7 @@ JSON schema:
         async def _run_ready(task: SubTask) -> SubTask:
             context_info = self._build_dependency_context(task, completed_by_id)
             async with sem:
-                return await self._execute_single(task, context_info, subagent_def=subagent_def)
+                return await self._invoke_execute_single(task, context_info, subagent_def=subagent_def)
 
         while pending:
             progressed = False
@@ -659,7 +709,7 @@ JSON schema:
         results = []
         context = ""
         for task in subtasks:
-            result = await self._execute_single(task, context, subagent_def=subagent_def)
+            result = await self._invoke_execute_single(task, context, subagent_def=subagent_def)
             results.append(result)
             if result.status == "success" and result.result:
                 context = result.result
@@ -670,29 +720,28 @@ JSON schema:
         total_time = sum(result.duration_ms for result in results)
 
         if not self._llm or not successes:
-            lines = [f"## Task Summary: {main_task}", ""]
+            lines = [f"## 任务总结: {main_task}", ""]
             for result in results:
                 lines.append(f"### {result.name} ({result.duration_ms:.0f}ms)")
                 if result.result:
                     lines.append(result.result[:500])
                 elif result.error:
-                    lines.append(f"(failed) {result.error}")
+                    lines.append(f"(失败) {result.error}")
                 lines.append("")
             return "\n".join(lines)
 
-        summary_prompt = f"""Summarize the following subtask execution results.
-Be concise but honest.
+        summary_prompt = f"""总结以下子任务执行结果，用中文简洁回答。
 
-Main task: {main_task}
+主任务: {main_task}
 
-Execution results:
+执行结果:
 {json.dumps([{"id": r.id, "name": r.name, "status": r.status, "result_preview": r.result[:500] if r.result else "", "error": r.error} for r in results], ensure_ascii=False, indent=2)}
 
-Requirements:
-- Integrate the useful findings from successful subtasks.
-- Explicitly mention failed or incomplete subtasks instead of hiding them.
-- Separate confirmed facts, judgments based on facts, and missing information.
-- End with a practical next-step recommendation."""
+要求:
+- 整合成功子任务的有用发现
+- 明确提及失败或不完整的子任务，不要隐藏
+- 区分确认的事实、基于事实的判断、缺失的信息
+- 最后给出下一步的实用建议"""
 
         from agent.types import Message, Role
 
