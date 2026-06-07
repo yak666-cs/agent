@@ -8,7 +8,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from agent.bootstrap import register_core_skills, register_core_tools, register_runtime_tools
+from agent.bootstrap import register_core_skills, register_core_subagents, register_core_tools, register_runtime_tools
 from agent.context import ContextManager, DEFAULT_SYSTEM_PROMPT
 from agent.llm import LLMClient
 from agent.loop import AgentLoop
@@ -22,6 +22,7 @@ from tools.selector import ToolSelector
 
 def _register_tools() -> None:
     register_core_tools()
+    register_core_subagents()
 
 
 def _register_skills() -> None:
@@ -38,9 +39,6 @@ def _build_agent():
     ctx = ContextManager(
         system_prompt=DEFAULT_SYSTEM_PROMPT,
         skill_prompt=skill_prompt,
-        window_size=40,
-        enable_summary=True,
-        enable_relevance=True,
     )
 
     agent = AgentLoop(llm=llm, context=ctx, max_turns=12)

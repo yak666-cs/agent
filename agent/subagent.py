@@ -11,6 +11,40 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
+
+# ── 子代理定义（类似 Claude SDK 的 AgentDefinition） ──
+
+@dataclass
+class SubagentDef:
+    """子代理声明式定义。注册后，subagent_delegate 工具可按 subagent_type 自动匹配。"""
+    name: str
+    description: str       # 描述何时使用（LLM 据此自动匹配）
+    prompt: str            # 注入子代理的 system prompt
+    tools: list[str]       # 允许的工具白名单（空 = 继承全部）
+    model: str = ""        # 模型名（空 = 继承父级）
+    max_turns: int = 12
+    permission: str = "read_only"
+
+
+class SubagentRegistry:
+    """子代理定义注册表"""
+
+    def __init__(self):
+        self._defs: dict[str, SubagentDef] = {}
+
+    def register(self, defn: SubagentDef) -> None:
+        self._defs[defn.name] = defn
+
+    def get(self, name: str) -> Optional[SubagentDef]:
+        return self._defs.get(name)
+
+    def list(self) -> list[SubagentDef]:
+        return list(self._defs.values())
+
+
+# 全局单例
+subagent_registry = SubagentRegistry()
+
 logger = logging.getLogger("agent.subagent")
 
 
@@ -83,6 +117,9 @@ class SubagentManager:
     ) -> str:
         logger.info("SubagentManager start | task=%s", (main_task or "")[:80])
 
+        # 如果 subagent_tool 在 manager 上设置了 _subagent_def，传递给所有子任务
+        subagent_def: Optional[SubagentDef] = getattr(self, '_subagent_def', None)
+
         decomposition = await self._decompose(main_task, context)
         if self._cb_decompose:
             self._cb_decompose(
@@ -117,13 +154,14 @@ class SubagentManager:
 
         actual_mode = self._resolve_mode(mode, decomposition)
         if actual_mode == ExecutionMode.PARALLEL:
-            results = await self._execute_parallel(decomposition.subtasks)
+            results = await self._execute_parallel(decomposition.subtasks, subagent_def=subagent_def)
         elif actual_mode == ExecutionMode.SEQUENTIAL:
-            results = await self._execute_sequential(decomposition.subtasks)
+            results = await self._execute_sequential(decomposition.subtasks, subagent_def=subagent_def)
         else:
             results = await self._execute_dependency_graph(
                 decomposition.subtasks,
                 completed=previous_tasks_by_id,
+                subagent_def=subagent_def,
             )
 
         all_results = list(previous_tasks_by_id.values()) + results
@@ -398,37 +436,53 @@ JSON schema:
             enable_relevance=source.enable_relevance,
         )
 
-    def _make_child_registry_and_selector(self):
+    def _make_child_registry_and_selector(self, allowed_tools: list[str] | None = None):
+        """创建子 Agent 使用的受限 Registry。
+
+        Args:
+            allowed_tools: 如果提供，只放行这些工具；否则默认排除 subagent_delegate。
+        """
         if not self._tool_registry:
             return None, None
+
+        if allowed_tools:
+            allowed_set = set(allowed_tools)
+        else:
+            allowed_set = None
 
         excluded = {"subagent_delegate"}
 
         class _FilteredRegistry:
-            def __init__(self, base, blocked: set[str]):
+            def __init__(self, base, allowed, blocked):
                 self._base = base
+                self._allowed = allowed
                 self._blocked = blocked
 
             def get(self, name: str):
                 if name in self._blocked:
                     return None
+                if self._allowed is not None and name not in self._allowed:
+                    return None
                 return self._base.get(name)
 
             def list_enabled(self):
-                return [tool for tool in self._base.list_enabled() if tool.name not in self._blocked]
+                all_tools = self._base.list_enabled()
+                if self._allowed is not None:
+                    return [t for t in all_tools if t.name not in self._blocked and t.name in self._allowed]
+                return [t for t in all_tools if t.name not in self._blocked]
 
             def get_tools_for_llm(self):
-                return [tool.to_openai_tool() for tool in self.list_enabled()]
+                return [t.to_openai_tool() for t in self.list_enabled()]
 
-        registry = _FilteredRegistry(self._tool_registry, excluded)
+        registry = _FilteredRegistry(self._tool_registry, allowed_set, excluded)
         selector = None
         if self._tool_selector:
             from tools.selector import ToolSelector
-
             selector = ToolSelector(registry, top_k=getattr(self._tool_selector, "top_k", 20))
         return registry, selector
 
-    async def _execute_single(self, subtask: SubTask, context_info: str = "") -> SubTask:
+    async def _execute_single(self, subtask: SubTask, context_info: str = "",
+                              subagent_def: Optional[SubagentDef] = None) -> SubTask:
         start = time.monotonic()
         subtask.status = "running"
         if self._cb_subtask_start:
@@ -438,15 +492,26 @@ JSON schema:
             if self._llm and self._tool_registry:
                 from agent.loop import AgentLoop
 
+                max_turns = subagent_def.max_turns if subagent_def else 15
+                allowed_tools = subagent_def.tools if subagent_def else None
+
                 ctx = self._make_child_context()
-                child_registry, child_selector = self._make_child_registry_and_selector()
-                agent = AgentLoop(llm=self._llm, context=ctx, max_turns=15)
+                child_registry, child_selector = self._make_child_registry_and_selector(allowed_tools)
+                agent = AgentLoop(llm=self._llm, context=ctx, max_turns=max_turns)
                 if child_registry:
                     agent.register_tool_registry(child_registry)
                 if self._tool_executor:
-                    agent.register_tool_executor(self._tool_executor)
+                    # 子 Agent 用 PERMISSIVE 沙箱（工具已被白名单过滤，无需沙箱二次拦截）
+                    from tools.executor import ToolExecutor as _TE
+                    from tools.sandbox import Sandbox, SandboxPolicy, SandboxMode
+                    child_executor = _TE(sandbox=Sandbox(SandboxPolicy(mode=SandboxMode.PERMISSIVE)))
+                    agent.register_tool_executor(child_executor)
                 if child_selector:
                     agent.register_tool_selector(child_selector)
+
+                # 如果有 subagent_def.prompt，用它覆写子 Agent 的 system prompt
+                if subagent_def and subagent_def.prompt:
+                    ctx.system_prompt = subagent_def.prompt
 
                 full_prompt = subtask.instructions
                 if context_info:
@@ -488,7 +553,8 @@ JSON schema:
 
         return subtask
 
-    async def _execute_parallel(self, subtasks: list[SubTask]) -> list[SubTask]:
+    async def _execute_parallel(self, subtasks: list[SubTask],
+                                 subagent_def: Optional[SubagentDef] = None) -> list[SubTask]:
         if not subtasks:
             return []
 
@@ -496,7 +562,7 @@ JSON schema:
 
         async def _run_with_sem(task: SubTask) -> SubTask:
             async with sem:
-                return await self._execute_single(task)
+                return await self._execute_single(task, subagent_def=subagent_def)
 
         return await asyncio.gather(*[_run_with_sem(task) for task in subtasks])
 
@@ -522,6 +588,7 @@ JSON schema:
         self,
         subtasks: list[SubTask],
         completed: dict[str, SubTask] | None = None,
+        subagent_def: Optional[SubagentDef] = None,
     ) -> list[SubTask]:
         if not subtasks:
             return []
@@ -538,7 +605,7 @@ JSON schema:
         async def _run_ready(task: SubTask) -> SubTask:
             context_info = self._build_dependency_context(task, completed_by_id)
             async with sem:
-                return await self._execute_single(task, context_info)
+                return await self._execute_single(task, context_info, subagent_def=subagent_def)
 
         while pending:
             progressed = False
@@ -587,11 +654,12 @@ JSON schema:
 
         return [results_by_id[task_id] for task_id in original_order if task_id in results_by_id]
 
-    async def _execute_sequential(self, subtasks: list[SubTask]) -> list[SubTask]:
+    async def _execute_sequential(self, subtasks: list[SubTask],
+                                   subagent_def: Optional[SubagentDef] = None) -> list[SubTask]:
         results = []
         context = ""
         for task in subtasks:
-            result = await self._execute_single(task, context)
+            result = await self._execute_single(task, context, subagent_def=subagent_def)
             results.append(result)
             if result.status == "success" and result.result:
                 context = result.result

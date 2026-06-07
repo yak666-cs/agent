@@ -27,7 +27,7 @@ if os.path.exists(env_path):
                     os.environ[k] = v
 
 from agent.loop import AgentLoop
-from agent.bootstrap import register_core_skills, register_core_tools
+from agent.bootstrap import register_core_skills, register_core_subagents, register_core_tools
 from agent.llm import LLMClient
 from agent.context import ContextManager, DEFAULT_SYSTEM_PROMPT
 
@@ -65,6 +65,7 @@ logging.basicConfig(level=logging.WARNING, format="%(asctime)s [%(name)s] %(leve
 
 def _register_all():
     register_core_tools()
+    register_core_subagents()
     register_core_skills()
 
 
@@ -132,9 +133,7 @@ def _store_context_info(ctx):
     _last_context_info.update({
         "max_tokens": ctx.max_tokens,
         "reserve_tokens": ctx.reserve_tokens,
-        "window_size": ctx.window_size,
-        "enable_summary": ctx.enable_summary,
-        "enable_relevance": ctx.enable_relevance,
+        "strategy": f"200K 全量保留，超出时从中间裁剪",
         "compression_log": ctx.compression_log[-20:] if ctx.compression_log else [],
         "total_compressions": len(ctx.compression_log),
     })
@@ -206,9 +205,6 @@ async def chat_stream(message: str, session_id: str = "", file_context: str = ""
     ctx = ContextManager(
         system_prompt=DEFAULT_SYSTEM_PROMPT,
         skill_prompt=skill_prompt,
-        window_size=40,
-        enable_summary=True,
-        enable_relevance=True,
     )
     agent = AgentLoop(llm=llm, context=ctx, max_turns=12)
     agent.register_tool_registry(tool_registry)
@@ -319,8 +315,7 @@ async def chat_stream(message: str, session_id: str = "", file_context: str = ""
                             "tool_data": tool_data,
                         })
                     if rows:
-                        conversation_store.clear_session_messages(session_id)
-                        conversation_store.save_messages(session_id, rows)
+                        conversation_store.replace_session_messages(session_id, rows)
                 except Exception:
                     pass
 
@@ -645,8 +640,8 @@ async def logout(request: Request):
 async def context_info():
     """获取当前上下文策略信息和压缩记录"""
     return _last_context_info if _last_context_info else {
-        "max_tokens": 128000, "reserve_tokens": 4000,
-        "window_size": 40, "enable_summary": True, "enable_relevance": True,
+        "max_tokens": 200000, "reserve_tokens": 2000,
+        "strategy": "200K 全量保留，超出时中间裁剪",
         "compression_log": [], "total_compressions": 0,
         "message": "还没有 Agent 运行记录，以上为默认配置"
     }

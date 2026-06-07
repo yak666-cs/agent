@@ -4,6 +4,7 @@ LLM client wrapper, defaulting to a DeepSeek-compatible chat API.
 
 import json
 import os
+import re
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
@@ -59,6 +60,17 @@ class LLMResponse:
             retryable=retryable,
             retry_after_seconds=retry_after_seconds,
         )
+
+
+# ── 辅助：清理 API 返回的非法字符（lone surrogate） ──
+_SURROGATE_RE = re.compile(r'[\ud800-\udfff]')
+
+
+def _sanitize(text: str) -> str:
+    """替换 lone surrogate 为 U+FFFD，避免 UnicodeEncodeError"""
+    if not text:
+        return ""
+    return _SURROGATE_RE.sub('�', text)
 
 
 class LLMClient:
@@ -173,7 +185,7 @@ class LLMClient:
                 continue
 
         return LLMResponse(
-            content=message.get("content", ""),
+            content=_sanitize(message.get("content", "")),
             tool_calls=tool_calls,
             finish_reason=finish,
             usage={

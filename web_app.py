@@ -17,7 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from agent.loop import AgentLoop
 from agent.llm import LLMClient
 from agent.context import ContextManager, DEFAULT_SYSTEM_PROMPT
-from agent.bootstrap import register_core_skills, register_core_tools, register_runtime_tools
+from agent.bootstrap import register_core_skills, register_core_subagents, register_core_tools, register_runtime_tools
 
 # Tool 层
 from tools.registry import tool_registry
@@ -63,6 +63,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelna
 
 def _register_all():
     register_core_tools()
+    register_core_subagents()
     register_core_skills()
 
 
@@ -114,9 +115,6 @@ async def chat_stream(message: str, session_id: str = ""):
     ctx = ContextManager(
         system_prompt=DEFAULT_SYSTEM_PROMPT,
         skill_prompt=skill_prompt,
-        window_size=40,
-        enable_summary=True,
-        enable_relevance=True,
     )
     agent = AgentLoop(llm=llm, context=ctx, max_turns=12)
     agent.register_tool_registry(tool_registry)
@@ -188,8 +186,7 @@ async def chat_stream(message: str, session_id: str = ""):
                             "tool_data": tool_data,
                         })
                     if rows:
-                        conversation_store.clear_session_messages(session_id)
-                        conversation_store.save_messages(session_id, rows)
+                        conversation_store.replace_session_messages(session_id, rows)
                 except Exception:
                     pass
             # 包含观测器指标 + 系统状态
